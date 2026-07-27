@@ -8,5 +8,5 @@ binding = "AMEX_KV"
 id = "187a6ba3b3ff404ea633e06d032903d5"
 
 [vars]
-SHEET_ID = "1Goi1tX23Q_nB6HPDvatYAucM38ZmRscG"
+SHEET_ID = "11QIu2DNzdxoO-vPM0rNWFTVBbl0RapB-uVlqncqyhiM"
 # BOARD_TOKEN, GOOGLE_SA_EMAIL, GOOGLE_SA_KEY set in the Cloudflare dashboard (never committed)
