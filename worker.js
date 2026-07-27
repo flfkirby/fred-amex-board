@@ -89,13 +89,17 @@ async function fetchSheet(env) {
   );
   if (!metaRes.ok) throw new Error(`sheet metadata: ${metaRes.status} ${await metaRes.text()}`);
   const meta = await metaRes.json();
-  const tabs = (meta.sheets || [])
-    .map((s) => s.properties.title)
-    .filter((t) => MONTH_TABS.includes(t))
-    .sort((a, b) => MONTH_TABS.indexOf(a) - MONTH_TABS.indexOf(b));
-  if (!tabs.length) throw new Error("no month tabs found");
+  const allTabs = (meta.sheets || []).map((s) => s.properties.title);
+  // prefer canonical month-name ordering where titles match; keep sheet order otherwise
+  const tabs = allTabs.sort((a, b) => {
+    const ia = MONTH_TABS.indexOf(a.slice(0, 3));
+    const ib = MONTH_TABS.indexOf(b.slice(0, 3));
+    if (ia !== -1 && ib !== -1) return ia - ib;
+    return allTabs.indexOf(a) - allTabs.indexOf(b);
+  });
+  if (!tabs.length) throw new Error("no tabs found");
 
-  const ranges = tabs.map((t) => `ranges=${encodeURIComponent(`${t}!A1:G500`)}`).join("&");
+  const ranges = tabs.map((t) => `ranges=${encodeURIComponent(`${t}!A1:N600`)}`).join("&");
   const valRes = await fetch(
     `https://sheets.googleapis.com/v4/spreadsheets/${env.SHEET_ID}/values:batchGet?${ranges}&valueRenderOption=UNFORMATTED_VALUE`,
     { headers: { Authorization: `Bearer ${token}` } }
@@ -132,24 +136,27 @@ function parseMonth(tab, rows) {
   const cDesc = col("description", 1);
   const cWho = col("who", 3);
   const cAmount = col("amount", 5);
-  const cCat = col("category", 6);
+  const cCat = col("category", 13);
   const cDate = col("date", 0);
 
   for (const r of rows.slice(headerIdx + 1)) {
     const desc = String(r[cDesc] ?? "").trim();
     const whoRaw = String(r[cWho] ?? "").trim().toUpperCase();
-    const amount = Number(r[cAmount]);
-    // Skip summary rows: no valid Who code, or "pay/total/split" wording, or no date+desc
+    const amount = Number(String(r[cAmount]).replace(/[£,]/g, ""));
+    // Only K/B/F rows are transactions — summary rows and card payments have no Who code
     if (!WHO_MAP[whoRaw]) continue;
-    if (!desc || /total|pay|split/i.test(desc) && !r[cDate]) continue;
-    if (!Number.isFinite(amount) || amount <= 0) continue; // ignore credits/refunds & blanks
+    if (!desc) continue;
+    if (!Number.isFinite(amount) || amount === 0) continue;
+    // charges are positive; negatives are refunds/credits and net off the totals
 
     const who = WHO_MAP[whoRaw];
     m.total += amount;
     m[who] += amount;
-    const cat = String(r[cCat] ?? "Uncategorised").trim() || "Uncategorised";
+    // Tidy Amex's "General Purchases-Online Purchases" style names
+    let cat = String(r[cCat] ?? "").trim() || "Uncategorised";
+    cat = cat.split("-").pop().trim() || cat;
     m.categories[cat] = (m.categories[cat] || 0) + amount;
-    m.top.push({ desc, amount, who });
+    if (amount > 0) m.top.push({ desc, amount, who });
   }
 
   m.categories = Object.entries(m.categories)
