@@ -222,6 +222,224 @@ function json(obj, status = 200) {
   });
 }
 
+// ---------------------------------------------------------------- Monzo
+// OAuth + webhook integration. One-time setup:
+//   1. developers.monzo.com → New OAuth Client: name "amex-board", redirect URL
+//      https://fred-amex-board.kirbyfred.workers.dev/monzo/callback , confidential
+//   2. Secrets: MONZO_CLIENT_ID, MONZO_CLIENT_SECRET
+//   3. Visit /monzo/auth?key=BOARD_TOKEN → approve in the Monzo app
+//      (this also registers the webhook and backfills recent transactions)
+// KV keys: monzo:tokens, monzo:state, monzo:tx:{YYYY-MM} (transaction maps)
+
+const MONZO_API = "https://api.monzo.com";
+
+async function monzoTokens(env) {
+  const raw = await env.AMEX_KV.get("monzo:tokens");
+  return raw ? JSON.parse(raw) : null;
+}
+
+async function monzoSaveTokens(env, t) {
+  await env.AMEX_KV.put(
+    "monzo:tokens",
+    JSON.stringify({ ...t, saved_at: Date.now() })
+  );
+}
+
+async function monzoRefresh(env, tokens) {
+  const res = await fetch(`${MONZO_API}/oauth2/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      client_id: env.MONZO_CLIENT_ID,
+      client_secret: env.MONZO_CLIENT_SECRET,
+      refresh_token: tokens.refresh_token,
+    }),
+  });
+  if (!res.ok) throw new Error(`Monzo token refresh failed (${res.status}) — reconnect at /monzo/auth`);
+  const t = await res.json();
+  await monzoSaveTokens(env, t);
+  return t;
+}
+
+async function monzoApi(env, path, opts = {}) {
+  let tokens = await monzoTokens(env);
+  if (!tokens) throw new Error("Monzo not connected — visit /monzo/auth");
+  let res = await fetch(`${MONZO_API}${path}`, {
+    ...opts,
+    headers: { ...(opts.headers || {}), Authorization: `Bearer ${tokens.access_token}` },
+  });
+  if (res.status === 401) {
+    tokens = await monzoRefresh(env, tokens);
+    res = await fetch(`${MONZO_API}${path}`, {
+      ...opts,
+      headers: { ...(opts.headers || {}), Authorization: `Bearer ${tokens.access_token}` },
+    });
+  }
+  if (!res.ok) throw new Error(`Monzo API ${path}: ${res.status} ${await res.text()}`);
+  return res.json();
+}
+
+function monzoMonthKey(created) {
+  return "monzo:tx:" + String(created).slice(0, 7); // YYYY-MM
+}
+
+async function monzoStoreTx(env, tx) {
+  // Only spending on the current account: negative amounts, not declined, not pot shuffles
+  if (!tx || tx.amount >= 0 || tx.decline_reason) return;
+  if (tx.scheme === "uk_retail_pot") return;
+  const key = monzoMonthKey(tx.created);
+  const raw = await env.AMEX_KV.get(key);
+  const map = raw ? JSON.parse(raw) : {};
+  map[tx.id] = {
+    created: tx.created,
+    amount: Math.abs(tx.amount) / 100, // pence → £, spend as positive
+    desc: (tx.merchant && tx.merchant.name) || tx.counterparty?.name || tx.description || "Unknown",
+    category: tx.category || "general",
+  };
+  await env.AMEX_KV.put(key, JSON.stringify(map));
+}
+
+async function monzoBackfill(env) {
+  const accounts = await monzoApi(env, "/accounts?account_type=uk_retail");
+  const account = (accounts.accounts || []).find((a) => !a.closed);
+  if (!account) throw new Error("No open Monzo current account found");
+  await env.AMEX_KV.put("monzo:account_id", account.id);
+
+  // register webhook (idempotent-ish: clear ours first)
+  const hookUrl = `${env.PUBLIC_URL || "https://fred-amex-board.kirbyfred.workers.dev"}/monzo/webhook/${env.BOARD_TOKEN}`;
+  const hooks = await monzoApi(env, `/webhooks?account_id=${account.id}`);
+  for (const h of hooks.webhooks || []) {
+    if (h.url.includes("/monzo/webhook/")) {
+      await monzoApi(env, `/webhooks/${h.id}`, { method: "DELETE" });
+    }
+  }
+  await monzoApi(env, "/webhooks", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ account_id: account.id, url: hookUrl }),
+  });
+
+  // backfill (Monzo allows ~90 days of history within 5 min of auth)
+  const since = new Date(Date.now() - 89 * 24 * 3600 * 1000).toISOString();
+  const txs = await monzoApi(
+    env,
+    `/transactions?account_id=${account.id}&since=${since}&expand[]=merchant&limit=200`
+  );
+  let stored = 0;
+  for (const tx of txs.transactions || []) {
+    await monzoStoreTx(env, tx);
+    if (tx.amount < 0 && !tx.decline_reason) stored++;
+  }
+  return { account: account.id, webhook: hookUrl, backfilled: stored };
+}
+
+async function monzoSummary(env) {
+  const now = new Date();
+  const months = [];
+  for (let i = 2; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const ym = d.toISOString().slice(0, 7);
+    const raw = await env.AMEX_KV.get("monzo:tx:" + ym);
+    const map = raw ? JSON.parse(raw) : {};
+    const txs = Object.values(map);
+    const total = txs.reduce((s, t) => s + t.amount, 0);
+    const cats = {};
+    for (const t of txs) cats[t.category] = (cats[t.category] || 0) + t.amount;
+    months.push({
+      month: d.toLocaleString("en-GB", { month: "short" }),
+      total: Math.round(total),
+      count: txs.length,
+      categories: Object.entries(cats)
+        .map(([name, amount]) => ({ name, amount: Math.round(amount) }))
+        .sort((a, b) => b.amount - a.amount)
+        .slice(0, 6),
+      recent: txs
+        .sort((a, b) => b.created.localeCompare(a.created))
+        .slice(0, 8)
+        .map((t) => ({ desc: t.desc, amount: Math.round(t.amount * 100) / 100, created: t.created.slice(0, 10) })),
+    });
+  }
+  const connected = !!(await monzoTokens(env));
+  return { connected, months };
+}
+
+async function handleMonzo(request, env, url) {
+  const path = url.pathname;
+
+  // Webhook: authenticated by secret path segment, NOT by BOARD_TOKEN param
+  if (path.startsWith("/monzo/webhook/")) {
+    if (path.split("/monzo/webhook/")[1] !== env.BOARD_TOKEN) {
+      return new Response("Not found", { status: 404 });
+    }
+    if (request.method !== "POST") return new Response("POST only", { status: 405 });
+    try {
+      const body = await request.json();
+      if (body.type === "transaction.created") await monzoStoreTx(env, body.data);
+      return json({ ok: true });
+    } catch (e) {
+      return json({ error: String(e.message || e) }, 400);
+    }
+  }
+
+  // Everything below requires BOARD_TOKEN (already checked by the main gate)
+  if (path === "/monzo/auth") {
+    if (!env.MONZO_CLIENT_ID) return json({ error: "Set MONZO_CLIENT_ID and MONZO_CLIENT_SECRET secrets first" }, 400);
+    const state = crypto.randomUUID();
+    await env.AMEX_KV.put("monzo:state", state, { expirationTtl: 600 });
+    const redirect = `${url.origin}/monzo/callback`;
+    const authUrl =
+      `https://auth.monzo.com/?client_id=${encodeURIComponent(env.MONZO_CLIENT_ID)}` +
+      `&redirect_uri=${encodeURIComponent(redirect)}&response_type=code&state=${state}`;
+    return Response.redirect(authUrl, 302);
+  }
+
+  if (path === "/monzo/callback") {
+    const code = url.searchParams.get("code");
+    const state = url.searchParams.get("state");
+    const saved = await env.AMEX_KV.get("monzo:state");
+    if (!code || !state || state !== saved) return json({ error: "Invalid OAuth state — start again at /monzo/auth" }, 400);
+    const res = await fetch(`${MONZO_API}/oauth2/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        client_id: env.MONZO_CLIENT_ID,
+        client_secret: env.MONZO_CLIENT_SECRET,
+        redirect_uri: `${url.origin}/monzo/callback`,
+        code,
+      }),
+    });
+    if (!res.ok) return json({ error: `Token exchange failed: ${await res.text()}` }, 500);
+    await monzoSaveTokens(env, await res.json());
+    return new Response(
+      `<body style="background:#0e1116;color:#e8e4da;font-family:system-ui;padding:40px">
+       <h2>Monzo connected</h2>
+       <p><strong>Now approve data access in your Monzo app</strong> (Strong Customer Authentication) — you have ~5 minutes.</p>
+       <p>Once approved there, open <a style="color:#c9a227" href="/monzo/setup?key=${url.searchParams.get("key") || ""}">/monzo/setup</a> to register the webhook and backfill 90 days.</p></body>`,
+      { headers: { "Content-Type": "text/html" } }
+    );
+  }
+
+  if (path === "/monzo/setup") {
+    try {
+      return json(await monzoBackfill(env));
+    } catch (e) {
+      return json({ error: String(e.message || e) }, 500);
+    }
+  }
+
+  if (path === "/api/monzo") {
+    try {
+      return json(await monzoSummary(env));
+    } catch (e) {
+      return json({ error: String(e.message || e) }, 500);
+    }
+  }
+
+  return new Response("Not found", { status: 404 });
+}
+
 // ---------------------------------------------------------------- MCP server
 // Streamable HTTP JSON-RPC at /mcp?key=TOKEN — same pattern as the ops board.
 const MCP_TOOLS = [
@@ -243,6 +461,12 @@ const MCP_TOOLS = [
   {
     name: "refresh_data",
     description: "Force a fresh read of the Google Sheet, bypassing the 10-minute cache, and return the updated spend board.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "get_monzo_spend",
+    description:
+      "Read Fred's Monzo day-to-day spending: last 3 months of totals, categories, and recent transactions, fed live by the Monzo webhook.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
   {
@@ -271,6 +495,8 @@ async function mcpToolCall(name, args, env) {
       return withAverages(await getData(env, false));
     case "refresh_data":
       return withAverages(await getData(env, true));
+    case "get_monzo_spend":
+      return monzoSummary(env);
     case "get_month": {
       const data = await getData(env, false);
       const m = data.months.find(
@@ -332,7 +558,13 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    // Monzo webhook authenticates via its secret path segment, not BOARD_TOKEN
+    if (url.pathname.startsWith("/monzo/webhook/")) return handleMonzo(request, env, url);
+
     if (!authed(request, url, env)) return new Response("Not found", { status: 404 });
+
+    if (url.pathname.startsWith("/monzo/") || url.pathname === "/api/monzo")
+      return handleMonzo(request, env, url);
 
     if (url.pathname === "/mcp") return handleMcp(request, env);
 
@@ -434,7 +666,7 @@ const HTML = `<!doctype html>
 const WHO = { fred:{label:"Fred",v:"--fred"}, fra:{label:"Francesca",v:"--fra"}, joint:{label:"Joint",v:"--joint"} };
 const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 const fmt = (n) => "£" + Math.round(n).toLocaleString("en-GB");
-let DATA = null, SEL = 0;
+let DATA = null, SEL = 0, MONZO = null;
 const KEY = new URLSearchParams(location.search).get("key") || "";
 
 async function load(fresh) {
@@ -446,6 +678,10 @@ async function load(fresh) {
     const data = await res.json();
     if (data.error) throw new Error(data.error);
     DATA = data; SEL = data.months.length - 1;
+    try {
+      const mres = await fetch("/api/monzo?key=" + encodeURIComponent(KEY), { headers: { "X-Board-Token": KEY } });
+      MONZO = await mres.json();
+    } catch { MONZO = null; }
     render();
   } catch (e) {
     app.innerHTML = '<div class="error">Couldn\\u2019t read the sheet: ' + e.message +
@@ -489,7 +725,7 @@ function render() {
       cur.top.map(t =>
         '<div class="txrow"><span><span class="sw" style="background:var(--' + t.who + ')"></span>' +
         esc(t.desc) + '</span><span>' + fmt(t.amount) + '</span></div>'
-      ).join("") + '</div></div>';
+      ).join("") + '</div></div>' + monzoPanel();
 
   document.querySelectorAll(".trend .col").forEach((el,i) =>
     el.addEventListener("click", () => { SEL = i; render(); }));
@@ -507,6 +743,25 @@ function trendCol(m, i, max) {
   return '<button class="col' + (i===SEL?" sel":"") + '"><div class="amt">' + fmt(m.total) +
     '</div><div class="bar" style="height:' + (m.total/max*100) + '%">' + segs +
     '</div><div class="mon">' + m.month + '</div></button>';
+}
+function monzoPanel() {
+  if (!MONZO || !MONZO.connected) {
+    return '<h2>Monzo \u2014 day to day</h2><p class="status">Not connected \u2014 open /monzo/auth?key=\u2026 to link Monzo.</p>';
+  }
+  const cur = MONZO.months[MONZO.months.length - 1];
+  const prev = MONZO.months.slice(0, -1);
+  const trend = prev.map(m => m.month + " " + fmt(m.total)).join(" \u00b7 ");
+  return '<h2>Monzo \u2014 day to day (' + cur.month + ')</h2>' +
+    '<div class="cards"><div class="card" style="border-top-color:#e05d5d">' +
+      '<div class="label">' + cur.month + ' total</div><div class="value">' + fmt(cur.total) + '</div>' +
+      '<div class="sub">' + cur.count + ' transactions' + (trend ? ' \u00b7 ' + trend : '') + '</div></div></div>' +
+    '<div class="detail"><div>' +
+      cur.categories.map(c => '<div class="catrow"><div class="head"><span>' + esc(c.name) +
+        '</span><span>' + fmt(c.amount) + '</span></div></div>').join("") +
+    '</div><div>' +
+      cur.recent.map(t => '<div class="txrow"><span>' + esc(t.desc) + ' <span style="color:var(--dim)">' +
+        t.created + '</span></span><span>' + fmt(t.amount) + '</span></div>').join("") +
+    '</div></div>';
 }
 const esc = (s) => s.replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
