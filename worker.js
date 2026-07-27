@@ -36,12 +36,27 @@ async function getAccessToken(env) {
   return (await res.json()).access_token;
 }
 
-async function importPrivateKey(pem) {
+async function importPrivateKey(raw) {
+  let pem = String(raw).trim();
+  // If the whole service-account JSON was pasted, pull out private_key
+  if (pem.startsWith("{")) {
+    try {
+      pem = JSON.parse(pem).private_key || "";
+    } catch {
+      const m = pem.match(/"private_key"\s*:\s*"([^"]+)"/);
+      if (m) pem = m[1];
+    }
+  }
   const body = pem
-    .replace(/-----BEGIN PRIVATE KEY-----/, "")
-    .replace(/-----END PRIVATE KEY-----/, "")
-    .replace(/\\n/g, "")
+    .replace(/-----[^-]+-----/g, "") // any BEGIN/END lines
+    .replace(/\\r|\\n/g, "") // escaped newlines from JSON strings
+    .replace(/["']/g, "")
     .replace(/\s/g, "");
+  if (!/^[A-Za-z0-9+/]+=*$/.test(body) || body.length < 100) {
+    throw new Error(
+      "GOOGLE_SA_KEY doesn't look like a valid private key — paste the private_key value from the service account JSON (BEGIN/END lines included is fine)"
+    );
+  }
   const der = Uint8Array.from(atob(body), (c) => c.charCodeAt(0));
   return crypto.subtle.importKey(
     "pkcs8",
