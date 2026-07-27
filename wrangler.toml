@@ -1,0 +1,12 @@
+name = "fred-amex-board"
+main = "worker.js"
+compatibility_date = "2026-07-01"
+keep_vars = true
+
+[[kv_namespaces]]
+binding = "AMEX_KV"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+[vars]
+SHEET_ID = "1Goi1tX23Q_nB6HPDvatYAucM38ZmRscG"
+# BOARD_TOKEN, GOOGLE_SA_EMAIL, GOOGLE_SA_KEY set in the Cloudflare dashboard (never committed)
