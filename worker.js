@@ -61,6 +61,11 @@ function b64urlBytes(bytes) {
 
 // ---------------------------------------------------------------- sheet read
 async function fetchSheet(env) {
+  if (!env.GOOGLE_SA_EMAIL || !env.GOOGLE_SA_KEY) {
+    throw new Error(
+      "Google credentials not set — add GOOGLE_SA_EMAIL and GOOGLE_SA_KEY as Secrets under the Worker's Settings > Variables and Secrets"
+    );
+  }
   const token = await getAccessToken(env);
   // Which tabs exist?
   const metaRes = await fetch(
